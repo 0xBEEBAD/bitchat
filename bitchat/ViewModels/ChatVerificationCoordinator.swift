@@ -58,6 +58,10 @@ protocol ChatVerificationContext: AnyObject {
     func noiseStaticPublicKeyData() -> Data
     func hasEstablishedNoiseSession(with peerID: PeerID) -> Bool
     func triggerHandshake(with peerID: PeerID)
+    /// Retries only private messages previously transmitted through a secure
+    /// session and still pending an ack. Both ephemeral and stable aliases
+    /// are supplied because either can own the outbox entry.
+    func retrySecurePrivateMessagesAfterAuthentication(for peerIDAliases: [PeerID])
     func sendVerifyChallenge(to peerID: PeerID, noiseKeyHex: String, nonceA: Data)
     func sendVerifyResponse(to peerID: PeerID, noiseKeyHex: String, nonceA: Data)
 
@@ -114,6 +118,10 @@ extension ChatViewModel: ChatVerificationContext {
 
     func noiseStaticPublicKeyData() -> Data {
         meshService.noiseStaticPublicKeyData()
+    }
+
+    func retrySecurePrivateMessagesAfterAuthentication(for peerIDAliases: [PeerID]) {
+        messageRouter.retrySecurePrivateMessagesAfterAuthentication(for: peerIDAliases)
     }
 
     func sendVerifyChallenge(to peerID: PeerID, noiseKeyHex: String, nonceA: Data) {
@@ -206,15 +214,36 @@ final class ChatVerificationCoordinator {
 
                     self.context.invalidateEncryptionCache(for: peerID)
 
-                    if self.context.cachedStablePeerID(for: peerID) == nil,
-                       let keyData = self.context.noiseSessionPublicKeyData(for: peerID) {
+                    var authenticatedStablePeerID: PeerID?
+                    if let keyData = self.context.noiseSessionPublicKeyData(for: peerID) {
                         let stablePeerID = PeerID(hexData: keyData)
-                        self.context.cacheStablePeerID(stablePeerID, for: peerID)
+                        authenticatedStablePeerID = stablePeerID
+                        if self.context.cachedStablePeerID(for: peerID) != stablePeerID {
+                            // The freshly authenticated Noise key outranks a
+                            // stale announce-derived alias.
+                            self.context.cacheStablePeerID(stablePeerID, for: peerID)
+                        }
                         SecureLogger.debug(
                             "🗺️ Mapped short peerID to Noise key for header continuity: \(peerID) -> \(stablePeerID.id.prefix(8))…",
                             category: .session
                         )
                     }
+
+                    // A locally established session may have belonged to the
+                    // peer's previous app process. The first ciphertext sent
+                    // into that stale session is retained by MessageRouter;
+                    // retry it now that this newly authenticated/replacement
+                    // session can actually decrypt it.
+                    var peerIDAliases = [peerID]
+                    if let stablePeerID = authenticatedStablePeerID
+                        ?? self.context.cachedStablePeerID(for: peerID),
+                       stablePeerID != peerID {
+                        // Conversations can migrate from the ephemeral BLE ID
+                        // to the authenticated Noise-key ID. Retry both aliases
+                        // because either may own the retained outbox entry.
+                        peerIDAliases.append(stablePeerID)
+                    }
+                    self.context.retrySecurePrivateMessagesAfterAuthentication(for: peerIDAliases)
 
                     if var pending = self.pendingQRVerifications[peerID], pending.sent == false {
                         self.context.sendVerifyChallenge(
