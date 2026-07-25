@@ -3323,6 +3323,28 @@ extension BLEService {
         }
     }
 
+    /// Replays the current generation's ready callback. Restore tests use
+    /// this to prove same-generation reconciliation is idempotent.
+    func _test_reconcileCurrentNoiseSession(for peerID: PeerID) {
+        let normalizedPeerID = peerID.toShort()
+        messageQueue.async(flags: .barrier) { [weak self] in
+            guard let self,
+                  let generation = self.noiseService.sessionGeneration(
+                    for: normalizedPeerID
+                  ),
+                  let fingerprint = self.noiseService.getPeerFingerprint(
+                    normalizedPeerID
+                  ) else {
+                return
+            }
+            self.handleNoisePeerAuthenticated(
+                peerID: normalizedPeerID,
+                fingerprint: fingerprint,
+                sessionGeneration: generation
+            )
+        }
+    }
+
     /// Builds an authenticated-session packet from an exact typed plaintext.
     /// Compatibility tests use this to model Android's deployed 0x20 file
     /// payload and the short-lived 0x09 prerelease payload without exposing a
@@ -4354,7 +4376,10 @@ extension BLEService {
     private func configureNoiseServiceCallbacks(for service: NoiseEncryptionService) {
         service.onPeerAuthenticatedWithGeneration = { [weak self] peerID, fingerprint, generation in
             SecureLogger.debug("🔐 Noise session authenticated with \(peerID.id.prefix(8))…, fingerprint: \(fingerprint.prefix(16))…")
-            self?.messageQueue.async { [weak self] in
+            // Authentication can be reported while an initiator is still
+            // returning XX message 3. Serialize generation-bound state and
+            // every post-handshake drain behind the handshake packet handler.
+            self?.messageQueue.async(flags: .barrier) { [weak self] in
                 self?.handleNoisePeerAuthenticated(
                     peerID: peerID,
                     fingerprint: fingerprint,
@@ -4429,7 +4454,9 @@ extension BLEService {
         }
         service.onSessionRestoredWithGeneration = { [weak self, weak service] peerID, generation in
             guard let self, let service else { return }
-            self.messageQueue.async { [weak self, weak service] in
+            // The manager makes restored keys visible atomically. Reconcile
+            // transport state and queued sends as the next serialized phase.
+            self.messageQueue.async(flags: .barrier) { [weak self, weak service] in
                 guard let self,
                       let service,
                       self.noiseService === service,
@@ -4497,7 +4524,16 @@ extension BLEService {
             }
         ) else { return }
 
-        guard let watchdog = transition.watchdog else { return }
+        guard let watchdog = transition.watchdog else {
+            // A quarantined transport restored the same cryptographic
+            // generation. Its capability proof and announce state never
+            // became stale; only work queued while outbound keys were paused
+            // needs one idempotent ready transition.
+            noisePacketHandler.handleSessionAuthenticated(normalizedPeerID)
+            sendPendingMessagesAfterHandshake(for: normalizedPeerID)
+            sendPendingNoisePayloadsAfterHandshake(for: normalizedPeerID)
+            return
+        }
 
         completePrivateMediaPolicyResolution(transition.rejected, with: .blockedDowngrade)
         schedulePrivateMediaProofTimeout(
@@ -4506,6 +4542,10 @@ extension BLEService {
             sessionGeneration: generation,
             nonce: watchdog.nonce
         )
+        // Cross-link delivery can put ciphertext sent immediately after
+        // message 3 ahead of message 3 itself. Retry the bounded queue only
+        // after this generation's transport state has been fully installed.
+        noisePacketHandler.handleSessionAuthenticated(normalizedPeerID)
 
         // `onPeerAuthenticated` can fire while the initiator is returning XX
         // message 3. This callback is queued behind the handshake handler, so
@@ -6116,14 +6156,28 @@ extension BLEService {
     // MARK: Packet Reception
     
     private func handleReceivedPacket(_ packet: BitchatPacket, from peerID: PeerID) {
-        // Call directly if already on messageQueue, otherwise dispatch
-        if DispatchQueue.getSpecific(key: messageQueueKey) == nil {
-            messageQueue.async { [weak self] in
-                self?.handleReceivedPacket(packet, from: peerID)
+        let isNoisePacket = packet.type == MessageType.noiseHandshake.rawValue
+            || packet.type == MessageType.noiseEncrypted.rawValue
+        if isNoisePacket {
+            // Handshake promotion, quarantine, and encrypted delivery share
+            // one session. Always enter through a barrier, including packets
+            // reinjected by fragment reassembly.
+            messageQueue.async(flags: .barrier) { [weak self] in
+                self?.handleReceivedPacketOnQueue(packet, from: peerID)
             }
-            return
+        } else if DispatchQueue.getSpecific(key: messageQueueKey) == nil {
+            messageQueue.async { [weak self] in
+                self?.handleReceivedPacketOnQueue(packet, from: peerID)
+            }
+        } else {
+            handleReceivedPacketOnQueue(packet, from: peerID)
         }
+    }
 
+    private func handleReceivedPacketOnQueue(
+        _ packet: BitchatPacket,
+        from peerID: PeerID
+    ) {
         let context = BLEReceivePipeline.context(for: packet, localPeerID: myPeerID)
         let senderID = context.senderID
         let messageID = context.messageID
@@ -6902,11 +6956,11 @@ extension BLEService {
         let wasEstablished = noiseService.hasEstablishedSession(with: peerID)
         let processed = noisePacketHandler.handleHandshake(packet, from: peerID)
         let isEstablished = noiseService.hasEstablishedSession(with: peerID)
-        if wasEstablished,
-           packet.payload.count == NoiseSecurityConstants.xxInitialMessageSize,
-           !isEstablished {
-            noteNoiseSessionCleared(for: peerID)
-        }
+        // An inbound message 1 quarantines the old transport receive-only.
+        // Keep its generation-bound BLE state intact: the manager's new
+        // handshaking generation already gates every outbound policy, while
+        // a rollback can become ready again without repeating capability
+        // proof or announce side effects.
         // XX message 1 is exactly the unauthenticated 32-byte ephemeral key.
         // During an ordinary reconnect, do not authenticate its ingress link
         // until a later message completes and proves the responder identity.
@@ -6940,6 +6994,11 @@ extension BLEService {
             hasNoiseSession: { [weak self] peerID in
                 self?.noiseService.hasSession(with: peerID) ?? false
             },
+            isAwaitingResponderHandshakeCompletion: { [weak self] peerID in
+                self?.noiseService.isAwaitingResponderHandshakeCompletion(
+                    with: peerID
+                ) ?? false
+            },
             initiateHandshake: { [weak self] peerID in
                 self?.initiateNoiseHandshake(with: peerID)
             },
@@ -6953,7 +7012,14 @@ extension BLEService {
                 guard let self = self else { throw NoiseEncryptionError.sessionNotEstablished }
                 let result = try self.noiseService.decryptWithSessionGeneration(
                     payload,
-                    from: peerID
+                    from: peerID,
+                    establishedGenerationIsReady: { generation in
+                        self.collectionsQueue.sync {
+                            self.privateMediaSessionGenerations[
+                                peerID.toShort()
+                            ] == generation
+                        }
+                    }
                 )
                 return BLENoiseDecryptionResult(
                     plaintext: result.plaintext,
