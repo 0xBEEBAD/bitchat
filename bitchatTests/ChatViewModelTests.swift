@@ -16,7 +16,9 @@ import BitFoundation
 /// Creates a ChatViewModel with mock dependencies for testing
 @MainActor
 private func makeTestableViewModel(
-    panicMediaWipe: (() throws -> Void)? = nil
+    panicMediaWipe: (() throws -> Void)? = nil,
+    panicRecoveryOperations: PanicRecoveryOperations? = nil,
+    panicNetworkLifecycle: PanicNetworkLifecycle = .noop
 ) -> (viewModel: ChatViewModel, transport: MockTransport) {
     let keychain = MockKeychain()
     let keychainHelper = MockKeychainHelper()
@@ -29,7 +31,9 @@ private func makeTestableViewModel(
         idBridge: idBridge,
         identityManager: identityManager,
         transport: transport,
-        panicMediaWipe: panicMediaWipe
+        panicMediaWipe: panicMediaWipe,
+        panicRecoveryOperations: panicRecoveryOperations,
+        panicNetworkLifecycle: panicNetworkLifecycle
     )
 
     return (viewModel, transport)
@@ -1122,13 +1126,87 @@ struct ChatViewModelPanicTests {
     @Test @MainActor
     func panicClearAllData_finishesMediaWipeBeforeReturning() {
         var wipeFinished = false
-        let (viewModel, _) = makeTestableViewModel {
+        let (viewModel, _) = makeTestableViewModel(panicMediaWipe: {
             wipeFinished = true
-        }
+        })
 
         viewModel.panicClearAllData()
 
         #expect(wipeFinished)
+    }
+
+    @Test @MainActor
+    func panicClearAllData_stopsNetworkBeforeWipeAndRestartsAfterCommit() {
+        var events: [String] = []
+        let lifecycle = PanicNetworkLifecycle(
+            stop: { events.append("stop") },
+            restart: { events.append("restart") }
+        )
+        let (viewModel, _) = makeTestableViewModel(
+            panicMediaWipe: { events.append("wipe") },
+            panicNetworkLifecycle: lifecycle
+        )
+
+        let completed = viewModel.panicClearAllData()
+
+        #expect(completed)
+        #expect(events == ["stop", "wipe", "restart"])
+        #expect(viewModel.networkActivationAllowed)
+    }
+
+    @Test @MainActor
+    func pendingPanicRecoveryCompletesBeforeTransportBootstrap() {
+        var events: [String] = []
+        let operations = PanicRecoveryOperations(
+            isPending: {
+                events.append("read")
+                return true
+            },
+            begin: {
+                events.append("begin")
+                return PanicRecoveryIntent(
+                    fileMarkerEstablished: true,
+                    externalMarkerEstablished: false
+                )
+            },
+            wipeMedia: { _ in events.append("wipe") },
+            complete: { events.append("complete") }
+        )
+
+        let (viewModel, transport) = makeTestableViewModel(
+            panicRecoveryOperations: operations
+        )
+
+        #expect(events == ["read", "begin", "wipe", "complete"])
+        #expect(transport.emergencyDisconnectCallCount == 1)
+        #expect(transport.startServicesCallCount == 1)
+        #expect(viewModel.networkActivationAllowed)
+    }
+
+    @Test @MainActor
+    func failedStartupRecoveryLeavesTransportAndNetworkBlocked() {
+        enum WipeFailure: Error { case failed }
+        var completedMarker = false
+        let operations = PanicRecoveryOperations(
+            isPending: { true },
+            begin: {
+                PanicRecoveryIntent(
+                    fileMarkerEstablished: true,
+                    externalMarkerEstablished: false
+                )
+            },
+            wipeMedia: { _ in throw WipeFailure.failed },
+            complete: { completedMarker = true }
+        )
+
+        let (viewModel, transport) = makeTestableViewModel(
+            panicRecoveryOperations: operations
+        )
+
+        #expect(!completedMarker)
+        #expect(transport.emergencyDisconnectCallCount == 1)
+        #expect(transport.startServicesCallCount == 0)
+        #expect(!viewModel.networkActivationAllowed)
     }
 
     @Test @MainActor

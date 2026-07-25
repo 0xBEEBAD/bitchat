@@ -27,6 +27,8 @@ protocol NetworkReachabilityMonitoring: AnyObject {
     var reachabilityPublisher: AnyPublisher<Bool, Never> { get }
     /// Begin monitoring. Idempotent.
     func start()
+    /// Stop monitoring and discard pending debounce work. Idempotent.
+    func stop()
 }
 
 /// Pure debounce/decision logic for reachability, split out so it can be
@@ -98,6 +100,7 @@ final class AlwaysReachableMonitor: NetworkReachabilityMonitoring {
         Empty(completeImmediately: false).eraseToAnyPublisher()
     }
     func start() {}
+    func stop() {}
 }
 
 /// `NWPathMonitor`-backed reachability. All state lives on the main actor; the
@@ -143,6 +146,18 @@ final class NWPathReachabilityMonitor: NetworkReachabilityMonitoring {
         monitor.start(queue: monitorQueue)
         #else
         // No Network framework: never suppress startup.
+        #endif
+    }
+
+    func stop() {
+        guard started else { return }
+        started = false
+        flushWorkItem?.cancel()
+        flushWorkItem = nil
+        #if canImport(Network)
+        monitor?.pathUpdateHandler = nil
+        monitor?.cancel()
+        monitor = nil
         #endif
     }
 
