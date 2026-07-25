@@ -17,11 +17,17 @@ struct BLEIncomingFileStore {
     let fileManager: FileManager
     private let baseDirectory: URL?
     private let dateProvider: () -> Date
+    private let privateMediaReceipts: BLEPrivateMediaReceiptStore
 
     init(fileManager: FileManager = .default, baseDirectory: URL? = nil, dateProvider: @escaping () -> Date = Date.init) {
         self.fileManager = fileManager
         self.baseDirectory = baseDirectory
         self.dateProvider = dateProvider
+        self.privateMediaReceipts = BLEPrivateMediaReceiptStore(
+            fileManager: fileManager,
+            baseDirectory: baseDirectory,
+            now: dateProvider
+        )
     }
 
     /// Resolves (and creates) an incoming-media directory for callers that
@@ -53,6 +59,35 @@ struct BLEIncomingFileStore {
         } catch {
             SecureLogger.error("❌ Failed to persist incoming media: \(error)", category: .session)
             return nil
+        }
+    }
+
+    func privateMediaReceiptState(
+        messageID: String
+    ) -> BLEPrivateMediaReceiptState {
+        privateMediaReceipts.state(for: messageID)
+    }
+
+    func commitPrivateMediaFile(
+        messageID: String,
+        storedURL: URL
+    ) -> Bool {
+        privateMediaReceipts.commitAccepted(
+            messageID: messageID,
+            storedURL: storedURL
+        )
+    }
+
+    /// Best-effort rollback for a payload whose durable receipt commit failed.
+    func removeIncomingFile(at storedURL: URL) {
+        guard isURLInsideFilesDirectory(storedURL) else { return }
+        do {
+            try fileManager.removeItem(at: storedURL)
+        } catch {
+            SecureLogger.warning(
+                "⚠️ Failed to roll back uncommitted incoming media: \(error)",
+                category: .session
+            )
         }
     }
 
@@ -122,6 +157,13 @@ struct BLEIncomingFileStore {
         let filesDir = root.appendingPathComponent("files", isDirectory: true)
         try fileManager.createDirectory(at: filesDir, withIntermediateDirectories: true, attributes: nil)
         return filesDir
+    }
+
+    private func isURLInsideFilesDirectory(_ url: URL) -> Bool {
+        guard let filesDirectory = try? filesDirectory().standardizedFileURL else {
+            return false
+        }
+        return url.standardizedFileURL.path.hasPrefix(filesDirectory.path + "/")
     }
 
     private func sanitizedFileName(_ name: String?, defaultName: String, fallbackExtension: String?) -> String {
