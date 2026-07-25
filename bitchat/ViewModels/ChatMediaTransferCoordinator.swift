@@ -171,9 +171,17 @@ final class ChatMediaTransferCoordinator {
         }
 
         let targetPeer = context.selectedPrivateChatPeer
+        let privateMessageID = targetPeer.flatMap { peerID in
+            PrivateMediaMessageIdentity.stableID(
+                senderPeerID: context.myPeerID,
+                recipientPeerID: peerID,
+                fileName: url.lastPathComponent
+            )
+        }
         let message = enqueueMediaMessage(
             content: "\(MimeType.Category.audio.messagePrefix)\(url.lastPathComponent)",
-            targetPeer: targetPeer
+            targetPeer: targetPeer,
+            messageID: privateMessageID
         )
         let messageID = message.id
         let transferId = makeTransferID(messageID: messageID)
@@ -282,9 +290,17 @@ final class ChatMediaTransferCoordinator {
 
                 await MainActor.run { [weak self] in
                     guard let self else { return }
+                    let privateMessageID = targetPeer.flatMap { peerID in
+                        PrivateMediaMessageIdentity.stableID(
+                            for: prepared.packet,
+                            senderPeerID: self.context.myPeerID,
+                            recipientPeerID: peerID
+                        )
+                    }
                     let message = self.enqueueMediaMessage(
                         content: "\(MimeType.Category.image.messagePrefix)\(prepared.outputURL.lastPathComponent)",
-                        targetPeer: targetPeer
+                        targetPeer: targetPeer,
+                        messageID: privateMessageID
                     )
                     let messageID = message.id
                     let transferId = self.makeTransferID(messageID: messageID)
@@ -316,12 +332,17 @@ final class ChatMediaTransferCoordinator {
         }
     }
 
-    func enqueueMediaMessage(content: String, targetPeer: PeerID?) -> BitchatMessage {
+    func enqueueMediaMessage(
+        content: String,
+        targetPeer: PeerID?,
+        messageID: String? = nil
+    ) -> BitchatMessage {
         let timestamp = Date()
         let message: BitchatMessage
 
         if let peerID = targetPeer {
             message = BitchatMessage(
+                id: messageID,
                 sender: context.nickname,
                 content: content,
                 timestamp: timestamp,

@@ -15,6 +15,11 @@
 import Testing
 import Foundation
 import BitFoundation
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 @testable import bitchat
 
 // MARK: - Mock Context
@@ -84,7 +89,11 @@ private final class MockChatMediaTransferContext: ChatMediaTransferContext {
     }
 
     // Mesh file transfer
-    private(set) var privateFileSends: [(peerID: PeerID, transferId: String)] = []
+    private(set) var privateFileSends: [(
+        packet: BitchatFilePacket,
+        peerID: PeerID,
+        transferId: String
+    )] = []
     private(set) var privateFileLegacyAllowances: [Bool] = []
     private(set) var broadcastFileSends: [String] = []
     private(set) var cancelledTransfers: [String] = []
@@ -149,7 +158,7 @@ private final class MockChatMediaTransferContext: ChatMediaTransferContext {
         transferId: String,
         allowLegacyFallback: Bool
     ) {
-        privateFileSends.append((peerID, transferId))
+        privateFileSends.append((packet, peerID, transferId))
         privateFileLegacyAllowances.append(allowLegacyFallback)
     }
 
@@ -167,19 +176,8 @@ private final class PausedVoiceNotePreparer: @unchecked Sendable {
     private var started = false
     private var released = false
     private var finished = false
-    private let packet: BitchatFilePacket
 
-    init() {
-        let content = Data("voice".utf8)
-        packet = BitchatFilePacket(
-            fileName: "paused.m4a",
-            fileSize: UInt64(content.count),
-            mimeType: "audio/mp4",
-            content: content
-        )
-    }
-
-    func prepare(_: URL) throws -> BitchatFilePacket {
+    func prepare(_ url: URL) throws -> BitchatFilePacket {
         condition.lock()
         started = true
         condition.broadcast()
@@ -189,7 +187,13 @@ private final class PausedVoiceNotePreparer: @unchecked Sendable {
         finished = true
         condition.broadcast()
         condition.unlock()
-        return packet
+        let content = Data("voice".utf8)
+        return BitchatFilePacket(
+            fileName: url.lastPathComponent,
+            fileSize: UInt64(content.count),
+            mimeType: "audio/mp4",
+            content: content
+        )
     }
 
     var hasStarted: Bool {
@@ -337,6 +341,57 @@ struct ChatMediaTransferCoordinatorContextTests {
         #expect(context.privateChats.isEmpty)
         #expect(context.appendedPublicMessages.isEmpty)
         #expect(coordinator.transferIdToMessageIDs.isEmpty)
+    }
+
+    @Test @MainActor
+    func privateVoiceNoteUsesWireDerivableMessageID() async throws {
+        let context = MockChatMediaTransferContext()
+        let coordinator = ChatMediaTransferCoordinator(context: context)
+        let peerID = PeerID(str: "1122334455667788")
+        context.selectedPrivateChatPeer = peerID
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voice_receipt_\(UUID().uuidString).m4a")
+        try Data("voice".utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        coordinator.sendVoiceNote(at: url)
+
+        #expect(await TestHelpers.waitUntil(
+            { context.privateFileSends.count == 1 },
+            timeout: TestConstants.longTimeout
+        ))
+        let message = try #require(context.privateChats[peerID]?.first)
+        let sentPacket = try #require(context.privateFileSends.first?.packet)
+        #expect(message.id == PrivateMediaMessageIdentity.stableID(
+            for: sentPacket,
+            senderPeerID: context.myPeerID,
+            recipientPeerID: peerID
+        ))
+    }
+
+    @Test @MainActor
+    func privateImageUsesWireDerivableMessageID() async throws {
+        let context = MockChatMediaTransferContext()
+        let coordinator = ChatMediaTransferCoordinator(context: context)
+        let peerID = PeerID(str: "99aabbccddeeff00")
+        context.selectedPrivateChatPeer = peerID
+        let sourceURL = try makeCoordinatorTestImageURL()
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+
+        coordinator.sendImage(from: sourceURL)
+
+        #expect(await TestHelpers.waitUntil(
+            { context.privateFileSends.count == 1 },
+            timeout: TestConstants.longTimeout
+        ))
+        let message = try #require(context.privateChats[peerID]?.first)
+        let sentPacket = try #require(context.privateFileSends.first?.packet)
+        #expect(message.id == PrivateMediaMessageIdentity.stableID(
+            for: sentPacket,
+            senderPeerID: context.myPeerID,
+            recipientPeerID: peerID
+        ))
+        coordinator.cleanupLocalFile(forMessage: message)
     }
 
     @Test @MainActor
@@ -583,4 +638,36 @@ struct ChatMediaTransferCoordinatorContextTests {
         #expect(context.legacyConsentRequests.isEmpty)
         #expect(context.privateFileSends.isEmpty)
     }
+}
+
+private func makeCoordinatorTestImageURL() throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("media-receipt-\(UUID().uuidString).png")
+    #if os(iOS)
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: 32, height: 32))
+    let image = renderer.image { context in
+        UIColor.systemBlue.setFill()
+        context.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+    }
+    guard let data = image.pngData() else {
+        throw CoordinatorMediaTestError.imageEncodingFailed
+    }
+    #else
+    let image = NSImage(size: NSSize(width: 32, height: 32))
+    image.lockFocus()
+    NSColor.systemBlue.setFill()
+    NSRect(x: 0, y: 0, width: 32, height: 32).fill()
+    image.unlockFocus()
+    guard let tiff = image.tiffRepresentation,
+          let bitmap = NSBitmapImageRep(data: tiff),
+          let data = bitmap.representation(using: .png, properties: [:]) else {
+        throw CoordinatorMediaTestError.imageEncodingFailed
+    }
+    #endif
+    try data.write(to: url, options: .atomic)
+    return url
+}
+
+private enum CoordinatorMediaTestError: Error {
+    case imageEncodingFailed
 }
