@@ -241,6 +241,7 @@ final class BLEService: NSObject {
     // that the session was established *on this current ingress link*, not
     // merely that some session exists for the claimed ID. bleQueue-owned.
     private var noiseAuthenticatedLinkOwners: [BLEIngressLinkID: PeerID] = [:]
+    private var noiseReconnectPolicy = BLENoiseReconnectPolicy()
 
     // Rotation-rebind cooldown per link UUID (bleQueue-owned, like the link
     // store): entries older than the cooldown are pruned on insert.
@@ -307,6 +308,9 @@ final class BLEService: NSObject {
     /// May block in tests to hold the serial message queue immediately before
     /// the deferred private-media admission check.
     var _test_beforePrivateMediaDeferredSend: ((String) -> Void)?
+    /// May block announce handling after verified-link rebind work is queued.
+    /// Tests use this boundary to prove rebind and reconnect are serialized.
+    var _test_afterVerifiedDirectRebindEnqueued: (() -> Void)?
     #endif
     private var selfBroadcastTracker = BLESelfBroadcastTracker()
     private let meshTopology = MeshTopologyTracker()
@@ -669,6 +673,8 @@ final class BLEService: NSObject {
 
         bleQueue.sync {
             pendingWriteBuffers.removeAll()
+            noiseAuthenticatedLinkOwners.removeAll()
+            noiseReconnectPolicy.removeAll()
             connectionScheduler.reset()
         }
         disconnectNotifyDebouncer.removeAll()
@@ -914,6 +920,7 @@ final class BLEService: NSObject {
         bleQueue.sync {
             linkStateStore.clearAll()
             noiseAuthenticatedLinkOwners.removeAll()
+            noiseReconnectPolicy.removeAll()
             connectionScheduler.reset()
             subscriptionAnnounceLimiter.removeAll()
         }
@@ -2438,6 +2445,7 @@ final class BLEService: NSObject {
             }
             for link in departedLinks {
                 noiseAuthenticatedLinkOwners.removeValue(forKey: link)
+                noiseReconnectPolicy.endLinkEpoch(link)
             }
         }
         _ = collectionsQueue.sync(flags: .barrier) {
@@ -2900,6 +2908,7 @@ extension BLEService: CBCentralManagerDelegate {
             pendingPeripheralWrites.discardAll(for: peripheralID)
         }
         noiseAuthenticatedLinkOwners.removeValue(forKey: .peripheral(peripheralID))
+        noiseReconnectPolicy.endLinkEpoch(.peripheral(peripheralID))
         _ = linkStateStore.removePeripheral(peripheralID)
         // A duplicate link can drop while the peer stays live on another
         // (the dual-role central link, or a second bound link after a
@@ -2954,6 +2963,7 @@ extension BLEService: CBCentralManagerDelegate {
             pendingPeripheralWrites.discardAll(for: peripheralID)
         }
         noiseAuthenticatedLinkOwners.removeValue(forKey: .peripheral(peripheralID))
+        noiseReconnectPolicy.endLinkEpoch(.peripheral(peripheralID))
         _ = linkStateStore.removePeripheral(peripheralID)
         
         SecureLogger.error("❌ Failed to connect to peripheral: \(peripheral.name ?? "Unknown") [\(peripheralID)] - Error: \(error?.localizedDescription ?? "Unknown")", category: .session)
@@ -3058,6 +3068,7 @@ extension BLEService {
                 self.pendingPeripheralWrites.discardAll(for: peripheralID)
             }
             self.noiseAuthenticatedLinkOwners.removeValue(forKey: .peripheral(peripheralID))
+            self.noiseReconnectPolicy.endLinkEpoch(.peripheral(peripheralID))
             _ = self.linkStateStore.removePeripheral(peripheralID)
             self.connectionScheduler.recordConnectionTimeout(peripheralID: peripheralID, at: Date())
             self.tryConnectFromQueue()
@@ -3710,6 +3721,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             pendingNotifications.removeTarget { $0.identifier.uuidString == centralID }
         }
         noiseAuthenticatedLinkOwners.removeValue(forKey: .central(centralID))
+        noiseReconnectPolicy.endLinkEpoch(.central(centralID))
         let removedPeerID = linkStateStore.removeSubscribedCentral(central)
         
         // Ensure we're still advertising for other devices to find us
@@ -4288,6 +4300,40 @@ extension BLEService {
             })
         }
     }
+
+    /// A peer-level session can outlive the physical link that established it.
+    /// Revalidate a fresh direct link with an ordinary XX exchange, retiring
+    /// cached sending keys atomically before message 1 can leave.
+    private func refreshNoiseSessionForVerifiedDirectLink(
+        _ packet: BitchatPacket,
+        peerID: PeerID
+    ) {
+        guard let link = collectionsQueue.sync(execute: { ingressLinks.link(for: packet) }) else {
+            return
+        }
+
+        let hasEstablishedSession = noiseService.hasEstablishedSession(with: peerID)
+        let authenticatedPeerLinks = currentNoiseAuthenticatedLinks(to: peerID)
+        let shouldRevalidate = readLinkState { store in
+            guard boundPeerID(for: link, in: store) == peerID else {
+                return false
+            }
+            return noiseReconnectPolicy.shouldRevalidate(
+                on: link,
+                hasEstablishedSession: hasEstablishedSession,
+                isNoiseAuthenticatedLink: noiseAuthenticatedLinkOwners[link] == peerID,
+                hasAuthenticatedPeerLink: !authenticatedPeerLinks.isEmpty,
+                now: Date()
+            )
+        }
+        guard shouldRevalidate else { return }
+
+        SecureLogger.info(
+            "🔄 Revalidating cached Noise session on fresh direct link to \(peerID.id.prefix(8))…",
+            category: .session
+        )
+        initiateNoiseReconnectHandshake(with: peerID)
+    }
     
     private func configureNoiseServiceCallbacks(for service: NoiseEncryptionService) {
         service.onPeerAuthenticatedWithGeneration = { [weak self] peerID, fingerprint, generation in
@@ -4305,6 +4351,29 @@ extension BLEService {
                 guard let self else { return }
                 self.noteNoiseSessionCleared(for: peerID)
                 self.broadcastNoiseHandshake(message, to: peerID)
+            }
+        }
+        service.onSessionRestoredWithGeneration = { [weak self, weak service] peerID, generation in
+            guard let self, let service else { return }
+            self.messageQueue.async { [weak self, weak service] in
+                guard let self,
+                      let service,
+                      self.noiseService === service,
+                      let fingerprint = service.getPeerFingerprint(peerID) else {
+                    return
+                }
+                SecureLogger.debug(
+                    "🔐 Restored quarantined Noise session with \(peerID.id.prefix(8))…",
+                    category: .session
+                )
+                // Re-enter the same generation-bound transition used after a
+                // successful handshake. This restores authenticated protocol
+                // state and drains both PM and typed-payload queues.
+                self.handleNoisePeerAuthenticated(
+                    peerID: peerID,
+                    fingerprint: fingerprint,
+                    sessionGeneration: generation
+                )
             }
         }
     }
@@ -4560,8 +4629,9 @@ extension BLEService {
             }
             return
         }
-        guard noiseService.hasSession(with: peerID) else {
-            // No session yet - queue the payload SYNCHRONOUSLY before initiating handshake
+        guard noiseService.hasEstablishedSession(with: peerID) else {
+            // No established session yet - queue the payload synchronously
+            // before initiating a handshake
             // to prevent race where fast handshake completion drains empty queue
             collectionsQueue.sync(flags: .barrier) {
                 self.pendingNoiseSessionQueues.appendTypedPayload(typedPayload, for: peerID)
@@ -5487,6 +5557,7 @@ extension BLEService {
                     self.pendingPeripheralWrites.discardAll(for: peripheralID)
                 }
                 self.noiseAuthenticatedLinkOwners.removeValue(forKey: .peripheral(peripheralID))
+                self.noiseReconnectPolicy.endLinkEpoch(.peripheral(peripheralID))
                 _ = self.linkStateStore.removePeripheral(peripheralID)
                 cancelled += 1
             }
@@ -5574,6 +5645,37 @@ extension BLEService {
             ttl: messageTTL
         )
         broadcastPacket(packet)
+    }
+
+    /// Starts a wire-compatible ordinary XX reconnect. The manager prepares
+    /// the initiator before atomically retiring the cached transport; the
+    /// one-shot claim prevents a crossed inbound message from making a stale
+    /// message 1 leave after this peer has already become responder.
+    private func initiateNoiseReconnectHandshake(with peerID: PeerID) {
+        let service = noiseService
+        do {
+            let initiation = try service.initiateReconnectHandshake(with: peerID)
+            noteNoiseSessionCleared(for: peerID)
+            messageQueue.async(flags: .barrier) { [weak self, weak service] in
+                guard let self,
+                      let service,
+                      self.noiseService === service,
+                      let handshakeData = service.claimHandshakeInitiation(
+                          initiation,
+                          for: peerID
+                      ) else {
+                    return
+                }
+                self.broadcastNoiseHandshake(handshakeData, to: peerID)
+            }
+        } catch NoiseSessionError.notEstablished {
+            initiateNoiseHandshake(with: peerID)
+        } catch {
+            SecureLogger.error(
+                "Failed to initiate ordinary reconnect: \(error)",
+                category: .session
+            )
+        }
     }
     
     private func sendPendingMessagesAfterHandshake(for peerID: PeerID) {
@@ -6114,6 +6216,9 @@ extension BLEService {
         // consolidate duplicate same-role connections onto that link.
         if let result, result.isVerified, result.isDirectAnnounce {
             rebindLinkAfterVerifiedDirectAnnounce(packet, to: result.peerID)
+            #if DEBUG
+            _test_afterVerifiedDirectRebindEnqueued?()
+            #endif
             retireRedundantPeripheralLinks(packet, to: result.peerID)
         }
 
@@ -6147,11 +6252,9 @@ extension BLEService {
             deliverCourierMailRemotely(to: result.peerID, noiseKey: noiseKey)
             if result.isDirectAnnounce,
                !hasCurrentNoiseAuthenticatedLink(to: result.peerID) {
-                if noiseService.hasEstablishedSession(with: result.peerID) {
-                    // A session with no surviving authenticated link is stale;
-                    // force the current link to prove possession again.
-                    clearNoiseSession(for: result.peerID)
-                }
+                // A cached session may predate this physical link.
+                // rebindLinkAfterVerifiedDirectAnnounce performs its atomic
+                // ordinary reconnect after the binding is published.
                 if !noiseService.hasSession(with: result.peerID) {
                     initiateNoiseHandshake(with: result.peerID)
                 }
@@ -6180,7 +6283,14 @@ extension BLEService {
                 linkUUID = centralUUID
                 previousPeerID = self.linkStateStore.peerID(forCentralUUID: centralUUID)
             }
-            guard let previousPeerID, previousPeerID != peerID else { return }
+            guard let previousPeerID else { return }
+            guard previousPeerID != peerID else {
+                self.refreshNoiseSessionForVerifiedDirectLink(
+                    packet,
+                    peerID: peerID
+                )
+                return
+            }
 
             // The signature does not authenticate directness (TTL is excluded
             // from signing because relays mutate it), so a "verified direct"
@@ -6207,12 +6317,20 @@ extension BLEService {
             // it across an announce-driven rebind, whose direct TTL is
             // replayable; the new owner must complete a fresh handshake.
             self.noiseAuthenticatedLinkOwners.removeValue(forKey: link)
+            self.noiseReconnectPolicy.endLinkEpoch(link)
             switch link {
             case .peripheral(let peripheralUUID):
                 self.linkStateStore.bindPeripheral(peripheralUUID, to: peerID)
             case .central(let centralUUID):
                 self.linkStateStore.bindCentral(centralUUID, to: peerID)
             }
+            // Keep the rebind and reconnect decision in one bleQueue critical
+            // section. No observer may see the new binding while a cached
+            // peer-level sender is still considered established.
+            self.refreshNoiseSessionForVerifiedDirectLink(
+                packet,
+                peerID: peerID
+            )
             SecureLogger.debug("🔄 Rebinding link after peer-ID rotation: \(previousPeerID.id.prefix(8))… → \(peerID.id.prefix(8))…", category: .session)
             self.refreshLocalTopology()
             // The announce that triggered this rebind was upserted as
@@ -6304,6 +6422,7 @@ extension BLEService {
                 pendingPeripheralWrites.discardAll(for: uuid)
             }
             noiseAuthenticatedLinkOwners.removeValue(forKey: .peripheral(uuid))
+            noiseReconnectPolicy.endLinkEpoch(.peripheral(uuid))
             _ = linkStateStore.removePeripheral(uuid)
             SecureLogger.info(
                 "🔗 Retiring redundant link \(uuid.prefix(8))… bound to \(peerID.id.prefix(8))…\(keptUUID.map { " (keeping \($0.prefix(8))…)" } ?? "")",
@@ -6689,9 +6808,14 @@ extension BLEService {
         let wasEstablished = noiseService.hasEstablishedSession(with: peerID)
         let processed = noisePacketHandler.handleHandshake(packet, from: peerID)
         let isEstablished = noiseService.hasEstablishedSession(with: peerID)
+        if wasEstablished,
+           packet.payload.count == NoiseSecurityConstants.xxInitialMessageSize,
+           !isEstablished {
+            noteNoiseSessionCleared(for: peerID)
+        }
         // XX message 1 is exactly the unauthenticated 32-byte ephemeral key.
-        // While replacing an existing session, do not authenticate its ingress
-        // link until a later message completes and validates the candidate.
+        // During an ordinary reconnect, do not authenticate its ingress link
+        // until a later message completes and proves the responder identity.
         let completedAuthenticatedHandshake = !wasEstablished
             || packet.payload.count != NoiseSecurityConstants.xxInitialMessageSize
         if processed, isEstablished, completedAuthenticatedHandshake {
